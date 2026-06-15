@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `/chat` web UI endpoint for interactive testing of any model through the proxy.
+
 ## [0.3.0] - 2026-06-06
 
 ### Added
