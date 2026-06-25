@@ -40,7 +40,12 @@ _OLLAMA_MODELS: dict[str, str] = {}  # model name -> Ollama base_url
 
 
 async def _discover_ollama_models(cfg: Settings, http: httpx.AsyncClient) -> None:
-    """Populate _OLLAMA_MODELS from cfg.ollama_backends."""
+    """Populate _OLLAMA_MODELS from cfg.ollama_backends.
+
+    Clears the registry first so a re-run (a second startup in the same
+    process) rediscovers from scratch rather than accumulating stale entries.
+    """
+    _OLLAMA_MODELS.clear()
     for key, base_url in cfg.ollama_backends.items():
         base_url = base_url.rstrip("/")
         if key == "*":
@@ -569,11 +574,6 @@ async def _handle_openai(request: Request, cfg: Settings, tm: TokenManager) -> A
     }
     http: httpx.AsyncClient = request.app.state.http
 
-    # --- routing: Ollama local models ---
-    ollama_url = _OLLAMA_MODELS.get(requested_model)
-    if ollama_url:
-        return await _handle_ollama(body, requested_model, streaming, ollama_url, http)
-
     # --- routing: Anthropic Claude (OpenAI → Anthropic translation) ---------
     if requested_model in cfg.anthropic_model_aliases:
         return await _handle_openai_to_anthropic(
@@ -598,20 +598,9 @@ async def _handle_openai(request: Request, cfg: Settings, tm: TokenManager) -> A
             upstream_body["model"],
             streaming,
         )
-    else:
+    elif requested_model in cfg.maas_model_aliases:
         # MaaS partner models (Kimi, GLM, MiniMax, Qwen, Grok).
-        path_fragment = cfg.maas_model_aliases.get(requested_model)
-        if path_fragment is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"unknown model '{requested_model}'. "
-                    f"known aliases — anthropic: {sorted(cfg.anthropic_model_aliases.keys())}, "
-                    f"gemini: {sorted(cfg.gemini_model_aliases.keys())}, "
-                    f"maas: {sorted(cfg.maas_model_aliases.keys())}, "
-                    f"ollama: {sorted(_OLLAMA_MODELS.keys())}"
-                ),
-            )
+        path_fragment = cfg.maas_model_aliases[requested_model]
         url = (
             f"https://{cfg.maas_region}-aiplatform.googleapis.com/v1beta1/projects/"
             f"{cfg.project_id}/locations/{cfg.maas_region}/{path_fragment}/chat/completions"
@@ -623,6 +612,23 @@ async def _handle_openai(request: Request, cfg: Settings, tm: TokenManager) -> A
             requested_model,
             path_fragment,
             streaming,
+        )
+    elif requested_model in _OLLAMA_MODELS:
+        # Ollama local models are checked after the Vertex routes so a
+        # discovered local model can never shadow a managed Vertex alias.
+        return await _handle_ollama(
+            body, requested_model, streaming, _OLLAMA_MODELS[requested_model], http
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unknown model '{requested_model}'. "
+                f"known aliases. anthropic: {sorted(cfg.anthropic_model_aliases.keys())}, "
+                f"gemini: {sorted(cfg.gemini_model_aliases.keys())}, "
+                f"maas: {sorted(cfg.maas_model_aliases.keys())}, "
+                f"ollama: {sorted(_OLLAMA_MODELS.keys())}"
+            ),
         )
 
     if streaming:

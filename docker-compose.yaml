@@ -22,8 +22,8 @@ services:
       VERTEX_PROXY_ANTHROPIC_REGION: ${VERTEX_PROXY_ANTHROPIC_REGION:-us-east5}
       VERTEX_PROXY_GEMINI_REGION: ${VERTEX_PROXY_GEMINI_REGION:-us-central1}
       VERTEX_PROXY_LOG_LEVEL: ${VERTEX_PROXY_LOG_LEVEL:-info}
-      # Ollama backend: auto-discover all models from local relay
-      VERTEX_PROXY_OLLAMA_BACKENDS: '{"*": "http://host.docker.internal:11435"}'
+      # Ollama backend: auto-discover all models from the host's Ollama
+      VERTEX_PROXY_OLLAMA_BACKENDS: '{"*": "http://host.docker.internal:11434"}'
       # Uncomment to require a bearer token on all routes:
       # VERTEX_PROXY_API_KEY: ${VERTEX_PROXY_API_KEY}
     extra_hosts:
