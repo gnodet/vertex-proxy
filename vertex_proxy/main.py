@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 # --- Ollama model registry (populated at startup) --------------------------
 _OLLAMA_MODELS: dict[str, str] = {}  # model name -> Ollama base_url
 
+# --- Custom provider model registry (populated at startup) -----------------
+# model alias -> (provider_name, base_url, api_key, upstream_model_id)
+_CUSTOM_PROVIDER_MODELS: dict[str, tuple[str, str, str, str]] = {}
+
 
 async def _discover_ollama_models(cfg: Settings, http: httpx.AsyncClient) -> None:
     """Populate _OLLAMA_MODELS from cfg.ollama_backends.
@@ -70,6 +74,66 @@ async def _discover_ollama_models(cfg: Settings, http: httpx.AsyncClient) -> Non
     if _OLLAMA_MODELS:
         logger.info(
             "ollama: %d models available: %s", len(_OLLAMA_MODELS), sorted(_OLLAMA_MODELS.keys())
+        )
+
+
+async def _discover_custom_providers(cfg: Settings, http: httpx.AsyncClient) -> None:
+    """Populate _CUSTOM_PROVIDER_MODELS from cfg.custom_providers.
+
+    Each provider entry must have 'base_url' and 'api_key'. 'models' is a dict
+    mapping alias → upstream model ID. If 'models' is empty, we attempt to
+    auto-discover via GET {base_url}/models.
+    """
+    _CUSTOM_PROVIDER_MODELS.clear()
+    for provider_name, provider_cfg in cfg.custom_providers.items():
+        base_url = provider_cfg.get("base_url", "").rstrip("/")
+        api_key = provider_cfg.get("api_key", "")
+        models: dict[str, str] = provider_cfg.get("models", {})
+
+        if not base_url:
+            logger.warning("custom_provider %s: missing base_url, skipping", provider_name)
+            continue
+        if not api_key:
+            logger.warning("custom_provider %s: missing api_key, skipping", provider_name)
+            continue
+
+        if not models:
+            # Auto-discover models from the provider's /models endpoint.
+            try:
+                resp = await http.get(
+                    f"{base_url}/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=10.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                for m in data.get("data", []):
+                    model_id = m.get("id", "")
+                    if model_id:
+                        models[model_id] = model_id
+                logger.info(
+                    "custom_provider %s: discovered %d models from %s",
+                    provider_name,
+                    len(models),
+                    base_url,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "custom_provider %s: failed to discover models from %s: %s",
+                    provider_name,
+                    base_url,
+                    exc,
+                )
+                continue
+
+        for alias, upstream_id in models.items():
+            _CUSTOM_PROVIDER_MODELS[alias] = (provider_name, base_url, api_key, upstream_id)
+
+        logger.info(
+            "custom_provider %s: %d models registered: %s",
+            provider_name,
+            len(models),
+            sorted(models.keys()),
         )
 
 
@@ -157,6 +221,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         app.state.cfg = cfg
         app.state.http = httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT)
         await _discover_ollama_models(cfg, app.state.http)
+        await _discover_custom_providers(cfg, app.state.http)
         try:
             yield
         finally:
@@ -261,6 +326,16 @@ def build_app(settings: Settings | None = None) -> FastAPI:
                     "provider": "ollama",
                 }
                 for name in _OLLAMA_MODELS
+            ]
+            + [
+                {
+                    "id": alias,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": info[0],  # provider_name
+                    "provider": f"custom-{info[0]}",
+                }
+                for alias, info in _CUSTOM_PROVIDER_MODELS.items()
             ],
         }
 
@@ -358,6 +433,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             or model_id in cfg.gemini_model_aliases
             or model_id in cfg.maas_model_aliases
             or model_id in _OLLAMA_MODELS
+            or model_id in _CUSTOM_PROVIDER_MODELS
             or model_id.startswith("google/")
         ):
             return {"id": model_id, "object": "model", "owned_by": "vertex-proxy"}
@@ -610,6 +686,15 @@ async def _handle_openai(request: Request, cfg: Settings, tm: TokenManager) -> A
             upstream_body["model"],
             streaming,
         )
+    elif requested_model in _CUSTOM_PROVIDER_MODELS:
+        # Custom OpenAI-compatible provider (direct API, not via Vertex).
+        provider_name, base_url, provider_api_key, upstream_id = _CUSTOM_PROVIDER_MODELS[
+            requested_model
+        ]
+        return await _handle_custom_provider(
+            body, requested_model, streaming, provider_name, base_url, provider_api_key,
+            upstream_id, http,
+        )
     elif requested_model in cfg.maas_model_aliases:
         # MaaS partner models (Kimi, GLM, MiniMax, Qwen, Grok).
         path_fragment = cfg.maas_model_aliases[requested_model]
@@ -638,6 +723,7 @@ async def _handle_openai(request: Request, cfg: Settings, tm: TokenManager) -> A
                 f"unknown model '{requested_model}'. "
                 f"known aliases. anthropic: {sorted(cfg.anthropic_model_aliases.keys())}, "
                 f"gemini: {sorted(cfg.gemini_model_aliases.keys())}, "
+                f"custom: {sorted(_CUSTOM_PROVIDER_MODELS.keys())}, "
                 f"maas: {sorted(cfg.maas_model_aliases.keys())}, "
                 f"ollama: {sorted(_OLLAMA_MODELS.keys())}"
             ),
@@ -695,6 +781,54 @@ async def _handle_ollama(
         raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
 
     return _passthrough_response(resp, route="ollama", model=requested_model)
+
+
+# --- Custom OpenAI-compatible provider handler -----------------------------
+
+
+async def _handle_custom_provider(
+    body: dict[str, Any],
+    requested_model: str,
+    streaming: bool,
+    provider_name: str,
+    base_url: str,
+    api_key: str,
+    upstream_model_id: str,
+    http: httpx.AsyncClient,
+) -> Any:
+    """Forward to a custom OpenAI-compatible provider's chat/completions."""
+    url = f"{base_url}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    upstream_body = dict(body)
+    upstream_body["model"] = upstream_model_id
+
+    logger.info(
+        "openai→custom(%s): model=%s → %s streaming=%s",
+        provider_name,
+        requested_model,
+        upstream_model_id,
+        streaming,
+    )
+
+    route_tag = f"custom-{provider_name}"
+
+    if streaming:
+        _METRICS.record_request(route_tag, requested_model, 200)
+        return StreamingResponse(
+            _stream_bytes(http, url, headers, upstream_body),
+            media_type="text/event-stream",
+        )
+
+    try:
+        resp = await http.post(url, headers=headers, json=upstream_body)
+    except httpx.HTTPError as exc:
+        logger.error("custom(%s) upstream error: %s", provider_name, exc)
+        raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
+
+    return _passthrough_response(resp, route=route_tag, model=requested_model)
 
 
 # --- OpenAI → Anthropic bridge (Claude via /v1/chat/completions) -----------
