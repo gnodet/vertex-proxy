@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -118,6 +119,25 @@ class Settings(BaseSettings):
         "grok-4.20": "publishers/xai/models/grok-4.20",
         "grok-4.1-fast": "publishers/xai/models/grok-4.1-fast",
     }
+
+    # --- Custom OpenAI-compatible providers ---
+    # Route models directly to third-party OpenAI-compatible APIs (MiniMax,
+    # Mistral, DeepSeek, etc.) instead of going through Vertex.
+    #
+    # Each key is a provider name (used in model listing and logs). Value is a
+    # dict with:
+    #   base_url  : API base URL (must support /chat/completions)
+    #   api_key   : Bearer token for the provider
+    #   models    : dict mapping alias → upstream model ID.
+    #              If empty ({}), the proxy will auto-discover via GET /models.
+    #
+    # Environment variable shape (JSON):
+    #   VERTEX_PROXY_CUSTOM_PROVIDERS='{"minimax": {"base_url": "https://api.minimax.chat/v1", "api_key": "sk-...", "models": {"minimax-m3": "minimax-m3"}}}'
+    #
+    # Models from custom providers take priority over MaaS aliases but NOT
+    # over Anthropic/Gemini/Ollama. This lets you override a Vertex MaaS
+    # model with a direct-API version while keeping the same model name.
+    custom_providers: dict[str, dict[str, Any]] = {}
 
 
 def load_settings() -> Settings:
