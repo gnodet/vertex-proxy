@@ -16,4 +16,5 @@ async def chat_ui(request: Request) -> Response:
     if not svc.settings.enable_chat_ui:
         return Response(status_code=404)
     from ..chat_ui import CHAT_HTML
+
     return HTMLResponse(CHAT_HTML)

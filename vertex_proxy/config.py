@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     # Serve a mini chat web UI at GET /chat for interactive model testing.
     # Disable with VERTEX_PROXY_ENABLE_CHAT_UI=false.
     enable_chat_ui: bool = True
+
     @field_validator("anthropic_region", "gemini_region", "maas_region")
     @classmethod
     def _location_name(cls, value: str) -> str:
